@@ -9,6 +9,10 @@ import logging
 import os
 import socket
 import sys
+import StringIO
+import subprocess
+import time
+import tempfile
 
 from datetime import datetime
 from dateutil import parser as dtparser
@@ -18,11 +22,10 @@ now = None
 def days_ago(tstamp):
     global now
     if now is None:
-        now = datetime.now()
-    # Datetime format from the last_modified property on keys from boto
-    backup = datetime.strptime(tstamp, '%Y-%m-%dT%H:%M:%S.%fZ')
-    delta = now - backup
-    return delta.days
+        now = time.time()
+    delta = now - tstamp
+    days = delta / 86400.0
+    return days
 
 def clean_backups(args, log):
 
@@ -30,51 +33,63 @@ def clean_backups(args, log):
         log.setLevel(logging.DEBUG)
 
     if not args.name:
-        args.name = socket.getfqdn()
+        args.name = socket.getfqdn() + ":"
 
     try:
-        s3conn = boto.connect_s3(aws_access_key_id=args.key,
-                                 aws_secret_access_key=args.secret,
-                                 security_token=args.token)
-        bucket = s3conn.get_bucket(args.bucket)
-    except boto.exception.BotoServerError, e:
-        log.error('Problem initializing S3 connection: %s', e)
-        sys.exit(1)
+        log.debug("gsutil ls -l gs://%s/%s%s" % (args.bucket,args.name,args.path))
+        process = subprocess.Popen("gsutil ls -l gs://%s/%s%s | grep -v TOTAL" % (args.bucket, args.name, args.path), shell=True, stdout=subprocess.PIPE)
+        process.wait()
+        if process.returncode != 0:
+            raise Exception("%s/%s%s" % (args.bucket, args.name, args.path))
+        else:
+            log.info("Connected to GS, getting keys ...")
+            keys = process.stdout.read()
+            key_list=[]
+            if keys:
+                for key in StringIO.StringIO(keys):
+                    key = key.strip()
+                    log.debug("%s" % (key))
+                    last_modified = key.split(" ")[2]
+                    file_name = key.split(" ")[4]
+                    key_list.append((file_name, time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ"))))
 
-    try:
-        key_list = bucket.list("%s:%s" % (args.name, args.path))
-    except boto.exception.BotoServerError, e:
-        log.error('Problem getting keys from S3 bucket: %s', e)
+    except Exception as e:
+        log.error('Problem getting keys from GS bucket: %s', e)
         sys.exit(1)
-
-    log.info("Connected to S3, getting keys ...")
 
     json_keys = []
     to_delete = set() # we'll remove from this list
     for k in sorted(
         key_list,
-        key=lambda k: dtparser.parse(k.last_modified),
+        key=lambda x: x[1],
         reverse=True, # most recent first
     ):
-        to_delete.add(k.name)
-        if k.name.endswith('-listdir.json'):
+        to_delete.add(k[0])
+        if k[0].endswith('-listdir.json'):
             json_keys.append(k)
 
     log.info("%s keys total", len(to_delete))
     log.debug("%s json listdir keys", len(json_keys))
 
-    is_old = False	# used in testing for existence of file on server
+    is_old = False  # used in testing for existence of file on server
     for jkey in json_keys:
-        log.debug("key dated : %s (%s)", jkey.last_modified,
-                  jkey.name.split('/')[-1])
-        if days_ago(jkey.last_modified) > args.age:
+        log.debug("key dated : %s (%s)", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(jkey[1])),
+                  jkey[0].split('/')[-1])
+        if days_ago(jkey[1]) > args.age:
             # We've gone back past our cutoff
-            log.info("Reached cutoff at timestamp %s", jkey.last_modified)
+            log.info("Reached cutoff at timestamp %s", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(jkey[1])))
             is_old = True
             if not args.keep_existing:
                 break
-        ky = bucket.get_key(jkey)
-        jdict = json.loads(ky.get_contents_as_string())
+
+        log.debug("gsutil cat %s" % (jkey[0]))
+        process = subprocess.Popen("gsutil cat %s" % (jkey[0]), shell=True, stdout=subprocess.PIPE)
+        process.wait()
+        if process.returncode == 0:
+            jdict = json.loads(process.stdout.read())
+        else:
+            log.debug('Unable to get %s' % (jkey[0]))
+
         if len(jdict.values()) != 1:
             raise SystemError('-listdir.json file should have '
                 'a single key/value pair!')
@@ -83,20 +98,20 @@ def clean_backups(args, log):
         fullpaths = [os.path.join(dirname, x) for x in jdict.values()[0]]
         keep_jkey = False # assume we are deleting the jkey
         for x in fullpaths:
-	    keep_file = True # assume we are keeping the file - this is the default behavior
-	    # if we are checking if we should keep existing files
-	    if args.keep_existing and is_old and not os.path.isfile(x):
-	        # don't keep the file if it is old and it does not exist
-	        keep_file = False
+            keep_file = True # assume we are keeping the file - this is the default behavior
+            # if we are checking if we should keep existing files
+            if args.keep_existing and is_old and not os.path.isfile(x):
+                # don't keep the file if it is old and it does not exist
+                keep_file = False
 
             keep_jkey = keep_jkey or keep_file  # keep the jkey if we are keeping any of the files
-	    key_to_keep = '%s:%s' % (args.name, x)
-	    # if we are keeping the file
-	    if keep_file and key_to_keep in to_delete:
-	        to_delete.remove(key_to_keep)
+            key_to_keep = 'gs://%s/%s%s' % (args.bucket, args.name, x)
+            # if we are keeping the file
+            if keep_file and key_to_keep in to_delete:
+                to_delete.remove(key_to_keep)
 
-        if keep_jkey and jkey.name in to_delete:
-            to_delete.remove(jkey.name)
+        if keep_jkey and jkey[0] in to_delete:
+            to_delete.remove(jkey[0])
 
     to_del_len = len(to_delete)
     if args.list_deletes:
@@ -106,21 +121,31 @@ def clean_backups(args, log):
         for delchunk in [','.join(to_del_list[i:i+10]) for \
                          i in xrange(0, to_del_len, 10)]:
             log.info("Files to delete: %s" % delchunk)
+
     if args.debug:
         log.debug("%s non-keeper keys to delete", to_del_len)
-        ddates = list(set([x.last_modified[:10] for x in key_list \
-                           if x.name in to_delete]))
+        ddates = list(set([time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(x[1])) for x in key_list \
+                           if x[0] in to_delete]))
         ddates.sort()
         log.debug("deletion dates : %s", ddates)
         log.debug("Test mode, nothing deleted")
         return
 
-    log.info("Deleting %s keys", to_del_len)
-
     try:
-        bucket.delete_keys(to_delete) # !!
+        log.info("Deleting %s keys", to_del_len)
+        tmpfile = tempfile.NamedTemporaryFile(delete=False)
+        for key in to_delete:
+            tmpfile.write("%s\n" % (key,))
+        process = subprocess.Popen("cat %s | gsutil -m rm -I" % (tmpfile.name), shell=True, stdout=subprocess.PIPE)
+        process.wait()
+        if process.returncode != 0:
+            raise Exception("%s" % (process.stdout.read()))
+        else:
+            log.debug("%s\n%s" % (tmpfile.name, process.stdout.read()))
+            tmpfile.close()
+
     except Exception as e:
-        log.error('S3 delete ERR, will try again later [%s]', e)
+        log.error('GS delete ERR, will try again later [%s]', e)
 
     log.info("Keys deleted")
 

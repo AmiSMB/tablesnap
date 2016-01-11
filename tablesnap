@@ -148,7 +148,8 @@ class UploadHandler(pyinotify.ProcessEvent):
         key = None
         for r in range(self.retries):
             try:
-                process = subprocess.Popen("gsutil stat %s/%s/%s" % (bucket, keyname, filename), shell=True, stdout-subprocess.PIPE)
+                self.log.debug("keyexists: Getting stats for gs://%s/%s" % (bucket, keyname))
+                process = subprocess.Popen("gsutil stat gs://%s/%s 2> /dev/null" % (bucket, keyname), shell=True, stdout=subprocess.PIPE)
                 process.wait()
                 returncode = process.returncode
                 key = process.stdout.read()
@@ -169,53 +170,54 @@ class UploadHandler(pyinotify.ProcessEvent):
             raise
 
         m = re.search("Content-Length:\t+(\d+)", key)
-        if m.group(1) != stat.st_size:
-            self.log.warning('ATTENTION: your source (%s) and target (%s) '
+        if int(m.group(1)) != int(stat.st_size):
+            self.log.warning('ATTENTION: your source (%s size %s) and target (%s size %s) '
                 'sizes differ, you should take a look. As immutable files '
                 'never change, one must assume the local file got corrupted '
                 'and the right version is the one in GS. Will skip this file '
-                'to avoid future complications' % (filename, keyname, ))
+                'to avoid future complications' % (filename, stat.st_size, keyname, m.group(1)))
             return True
         else:
             if not self.md5_on_start:
                 # Don't bother computing MD5 at startup
+                self.log.info("Keyname %s already exists, skipping upload"
+                              % (keyname))
                 return True
             else:
-                # Compute MD5 sum of file
                 try:
-                    fp = open(filename, "r")
-                except IOError as (errno, strerror):
-                    if errno == 2:
-                        # The file was removed, return True to skip this file.
-                        return True
+                    self.log.debug('Computing md5 of %s' %(filename))
+                    # Compute MD5 sum of file
+                    process = subprocess.Popen("gsutil hash -m %s 2> /dev/null" % (filename), shell=True, stdout=subprocess.PIPE)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise
+                    md5_data = process.stdout.read()
+                    m = re.search("Hash \(md5\):\t+(.*)", md5_data)
+                    if m:
+                        md5 = m.group(1)
+                except:
+                    self.log.critical("Failed to md5 %s" % (filename))
+                    pass
 
-                    self.log.critical("Failed to open file: %s (%s)\n%s" %
-                                 (filename, strerror, format_exc(),))
-                    raise
-
-                md5 = key.compute_md5(fp)
-                fp.close()
-                self.log.debug('Computed md5: %s' % (md5,))
+                if md5:
+                    self.log.debug('Computed md5: %s' % (md5,))
                 
                 m = re.search("Hash \(md5\):\t+(.*)", key)
                 if m:
                     meta = m.group(1)
 
                 if meta:
-                    self.log.debug('MD5 metadata comparison: %s == %s? : %s' %
-                                  (md5[0], meta, (md5[0] == meta)))
-                    result = (md5[0] == meta)
-                else:
-                    m = re.search("ETag:\t+(.*)", key)
-                    if m:
-                        self.log.debug('ETag comparison: %s == %s? : %s' %
-                                      (md5[0], m.group(1),
-                                      (md5[0] == m.group(1)))
-                        result = (md5[0] == m.group(1))
-                    if result:
-                        self.log.debug('Setting missing md5sum metadata for %s' %
-                                      (keyname,))
-                        key.set_metadata('md5sum', md5[0])
+                    result = (md5 == meta)
+                    self.log.debug('MD5 metadata comparison: %s == %s? : %s' % (md5, meta, result))
+                #else:
+                #    m = re.search("ETag:\t+(.*)", key)
+                #    if m:
+                #        result = ( md5[0] == str(m.group(1)) )
+                #        self.log.debug('ETag comparison: %s == %s? : %s' % ( md5[0], m.group(1), result )
+                #    if result:
+                #        self.log.debug('Setting missing md5sum metadata for %s' %
+                #                      (keyname,))
+                #        key.set_metadata('md5sum', md5[0])
         
                 if result:
                     self.log.info("Keyname %s already exists, skipping upload"
@@ -284,13 +286,23 @@ class UploadHandler(pyinotify.ProcessEvent):
             return
         else:
             try:
-                fp = open(filename, 'rb')
-            except IOError:
-                # File removed?
-                return
-            md5 = boto.utils.compute_md5(fp)
-            self.log.debug('Computed md5sum before upload is: %s' % (md5,))
-            fp.close()
+                self.log.debug( "upload_sstable: Computing md5 of %s" %(filename))
+                process = subprocess.Popen("gsutil hash -m %s 2> /dev/null" % (filename), shell=True, stdout=subprocess.PIPE)
+                process.wait()
+                if process.returncode != 0:
+                    raise
+                key = process.stdout.read()
+                m = re.search("Hash \(md5\):\t+(.*)", key)
+                if m:
+                    md5 = m.group(1)
+            except:
+                self.log.critical("Failed to md5 %s" % (filename))
+                md5 = None
+                pass
+
+            if md5:
+                self.log.debug('Computed md5sum before upload is: %s' % (md5,))
+
 
         def progress(sent, total):
             if sent == total:
@@ -310,12 +322,15 @@ class UploadHandler(pyinotify.ProcessEvent):
                         fp = tempfile.NamedTemporaryFile()
                         fp.write(json_str)
                         fp.flush()
-                        process = subprocess.Popen("gsutil -h Content-Type:application/json cp %s gs://%s/%s/%s" % (fp.name, bucket, keyname, filename), shell=True, stdout-subprocess.PIPE)
+                        self.log.debug('Writing index json file %s-listdir.json' % keyname)
+                        process = subprocess.Popen("gsutil -h Content-Type:application/json cp %s gs://%s/%s-listdir.json 2> /dev/null" % (fp.name, bucket, keyname), shell=True, stdout=subprocess.PIPE)
                         process.wait()
                         # Note calling close() on the temp file deletes it as this is the default for NamedTempFile
                         fp.close()
                         if process.returncode != 0:
                             raise
+                        else:
+                            self.log.debug('Successfully uploaded %s-listdir.json' % (keyname))
                         break
                     except:
                         if r == self.retries - 1:
@@ -349,7 +364,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                     self.log.debug('File size check: %s > %s ? : %s' %
                         (stat.st_size, self.max_size,
                         (stat.st_size > self.max_size),))
-                    '''
+                    """
                     if stat.st_size > self.max_size:
                         self.log.info('Performing multipart upload for %s' %
                                      (filename))
@@ -379,13 +394,15 @@ class UploadHandler(pyinotify.ProcessEvent):
                         mp.complete_upload()
                         progress(100, 100)
                     else:
-                    ''' 
-                        self.log.debug('Performing monolithic upload')
-                        process = subprocess.Popen("gsutil -h Content-MD5:%s cp %s gs://%s/%s/%s" % (md5[0], filename, bucket, keyname, filename), shell=True, stdout-subprocess.PIPE)
-                        process.wait()
-                        if process.returncode != 0:
-                            raise
-                        #key.set_metadata('stat', meta)
+                    """
+                    self.log.debug('Performing monolithic upload for bucket %s keyname %s filename %s md5 %s stat %s' % (bucket, keyname, filename, md5, meta.replace('/\"\ /g','')))
+                    process = subprocess.Popen('gsutil -h Content-MD5:%s -h x-goog-meta-stat:"%s" cp %s gs://%s/%s 2> /dev/null' % (md5, meta.replace('/\"\ /g',''), filename, bucket, keyname), shell=True, stdout=subprocess.PIPE)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise
+                    else:
+                        self.log.info("Upload of %s successful" % (filename))
+                    #key.set_metadata('stat', meta)
                     break
                 except:
                     if not os.path.exists(filename):

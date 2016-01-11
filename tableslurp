@@ -28,7 +28,11 @@ import os
 import pwd
 import socket
 import sys
+import subprocess
+import StringIO
+import time
 from Queue import Queue
+import re
 
 log = logging.getLogger('tableslurp')
 stderr = logging.StreamHandler()
@@ -101,13 +105,13 @@ class DownloadHandler(object):
 
     def _get_bucket(self):
 #       unsure if boto is thread-safe, will reconnect every time
-        log.debug('Connecting to s3')
-        conn = boto.connect_s3(aws_access_key_id=self.key,
-                               aws_secret_access_key=self.secret,
-                               security_token=self.token)
-        bucket = conn.get_bucket(self.bucket_name)
-        log.debug('Connected to s3')
-        return bucket
+        #log.debug('Connecting to s3')
+        #conn = boto.connect_s3(aws_access_key_id=self.key,
+        #                       aws_secret_access_key=self.secret,
+        #                       security_token=self.token)
+        #bucket = conn.get_bucket(self.bucket_name)
+        log.debug('Connected to GS')
+        return self.bucket_name
 
     def _build_file_set(self, target_file=None):
         log.info('Building fileset')
@@ -115,43 +119,47 @@ class DownloadHandler(object):
 #       If you want to restore a file-set in particular
         bucket = self._get_bucket()
         if target_file:
-            key = bucket.get_key('%s/%s-listdir.json' %
-                (self.prefix, target_file))
+            key = 'gs://%s/%s/%s-listdir.json' % (bucket, self.prefix, target_file)
 #       Otherwise try to fetch the most recent one
         else:
-            prefix_part_count = self.prefix.count('/') + 1
-            keys = [_ for _ in bucket.list(prefix='%s/' %
-                (self.prefix,)) if _.name.endswith('-listdir.json') and _.name.count('/') == prefix_part_count]
-            if keys:
-                keys.sort(key=lambda l: parser.parse(l.last_modified))
-                key = keys.pop()
+            log.debug("gsutil ls -l gs://%s/%s/*.json" % (self.bucket_name, self.prefix))
+            process = subprocess.Popen("gsutil ls -l gs://%s/%s/*.json | grep -v TOTAL" % (self.bucket_name,self.prefix), shell=True, stdout=subprocess.PIPE)
+            process.wait()
+            if process.returncode == 0:
+                listdirs = process.stdout.read()
+            else:
+                log.debug("Unable to get listing for gs://%s/%s/" % (self.bucket_name, self.prefix))
+            file_list=[]
+            if listdirs:
+                for listdir in StringIO.StringIO(listdirs):
+                    listdir = listdir.strip()
+                    last_modified = listdir.split(" ")[2]
+                    file_name = listdir.split(" ")[4]
+                    file_details = (file_name,time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ")))
+                    file_list.append(file_details)
+
+                if file_list:
+                    sorted_file_list = sorted(file_list,key=lambda x: x[1],reverse=True)
+                    key = sorted_file_list[0][0]
+                    log.debug("key %s" % (key))
+            else:
+                log.info("No files returned for gs://%s/%s/" % (self.bucket_name,self.prefix))
 
         if not key:
             raise LookupError('Cannot find anything to restore from %s:%s/%s' %
                 (bucket.name, self.prefix, target_file or ''))
 
-        json_data = json.loads(key.get_contents_as_string())
-        self.fileset = json_data[self.origin]
-        log.info('Fileset contains %d files to download' % (len(self.fileset)))
-        k = bucket.get_key('%s/%s' % (self.prefix, self.fileset[0]))
-#       The librato branch introduced this
-        meta = k.get_metadata('stat')
-        log.debug('Metadata is %s' % (meta,))
-        owner = None
-        group = None
-        if meta:
-            try:
-                json_data = json.loads(meta)
-                owner = json_data['user']
-                group = json_data['group']
-            except TypeError as te:
-                log.debug(te)
-                log.warning('Could not parse stat metadata for %s' % (k.name,))
-            except KeyError as ke:
-                log.debug(ke)
-                log.warning('Incomplete stat metadata for %s, will ignore' %
-                    (k.name,))
-        return (owner, group)
+        log.debug("gsutil cat %s" % (key))
+        process = subprocess.Popen("gsutil cat %s" % (key), shell=True, stdout=subprocess.PIPE)
+        process.wait()
+        if process.returncode == 0:
+            json_data = json.loads(process.stdout.read())
+            self.fileset = json_data[self.origin]
+            log.info('Fileset contains %d files to download' % (len(self.fileset)))
+        else:
+            log.debug('Unable to get %s' % (key))
+
+        return (0,0)
 
     def _test_permissions(self):
         log.info('Will now try to test writing to the target dir %s' %
@@ -180,47 +188,62 @@ class DownloadHandler(object):
             keypath = '%s/%s' % (self.prefix, fname,)
             destfile = os.path.join(self.target, os.path.basename(fname))
 
-            log.debug('Checking if we need to download %s to %s' %
-                (keypath, destfile,))
+            log.debug('Thread #%d Checking if we need to download %s to %s' %
+                (idx, keypath, destfile))
 
             if queueddownload.attemptcount < 5:
                 download = False
                 #Retry downloading until we succeed
                 try:
-                    key = bucket.get_key(keypath)
-                    log.debug('Key objectd is %s' % key)
+                    key = "gs://%s/%s" % (bucket,keypath)
+                    process = subprocess.Popen("gsutil stat %s 2> /dev/null" % (key), shell=True, stdout=subprocess.PIPE)
+                    process.wait()
+                    returncode = process.returncode
+                    if returncode != 0:
+                        raise Exception('Thread #%d key %s does not exist' %(idx,key))
+                    else:
+                        log.debug('Thread #%d Found key %s' % (idx,key))
+                        m = re.search("Content-Length:\t+(\d+)", process.stdout.read())
+                        if m:
+                            key_size = int(m.group(1))
+                        else:
+                            raise Exception('Thread #%d unable get get stats for %s' % (idx, key))
+
                     if os.path.isfile(destfile):
                         stat = os.stat(destfile)
                         if self.force:
                             download = True
-                        elif stat.st_size != key.size:
-                            log.info('%s and %s size differs, will '
-                                're-download' % (key.name, destfile,))
+                        elif stat.st_size != key_size:
+                            log.info('Thread #%d files %s and %s size differs, will '
+                                're-download' % (idx, key, destfile,))
                             download = True
                     else:
                         download = True
 
                     if download and key:
-                        log.info('Downloading %s from %s to %s' %
-                            (key.name, bucket.name, destfile))
-                        key.get_contents_to_filename(destfile)
+                        log.info('Thread #%d downloading %s from %s to %s' %
+                            (idx, fname, key, destfile))
+                        process = subprocess.Popen("gsutil cp %s %s" % (key,destfile), shell=True, stdout=subprocess.PIPE)
+                        process.wait()
+                        if process.returncode != 0:
+                            raise Exception('Thread #%d unable to download %s' % (idx, key))
 
                 except Exception as e:
                     log.debug(e)
-                    log.exception('Failed to download `%s` retrying' %
-                        (fname,))
+                    log.exception('Thread #%d Failed to download `%s` retrying' %
+                        (idx, fname))
                     #We can't download, try again
                     queueddownload.increment()
                     queue.put(queueddownload)
 
             else:
-                log.info('Tried to download %s too many times.  Giving up' %
-                    fname)
+                log.info('Thread #%d tried to download %s too many times.  Giving up' %
+                    (idx, fname))
 
             #Pop the task regardless of state.  If it fails we've put it back
             queue.task_done()
 
-        log.info('Thread #%d finished processing' % (idx,))
+        log.info('Thread #%d finished processing' % (idx))
 
     def run(self):
         self._test_permissions()
