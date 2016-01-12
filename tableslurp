@@ -104,13 +104,6 @@ class DownloadHandler(object):
                 (owner, group,))
 
     def _get_bucket(self):
-#       unsure if boto is thread-safe, will reconnect every time
-        #log.debug('Connecting to s3')
-        #conn = boto.connect_s3(aws_access_key_id=self.key,
-        #                       aws_secret_access_key=self.secret,
-        #                       security_token=self.token)
-        #bucket = conn.get_bucket(self.bucket_name)
-        log.debug('Connected to GS')
         return self.bucket_name
 
     def _build_file_set(self, target_file=None):
@@ -123,7 +116,7 @@ class DownloadHandler(object):
 #       Otherwise try to fetch the most recent one
         else:
             log.debug("gsutil ls -l gs://%s/%s/*.json" % (self.bucket_name, self.prefix))
-            process = subprocess.Popen("gsutil ls -l gs://%s/%s/*.json | grep -v TOTAL" % (self.bucket_name,self.prefix), shell=True, stdout=subprocess.PIPE)
+            process = subprocess.Popen("gsutil ls -l gs://%s/%s/*.json 2> /dev/null | grep -v TOTAL" % (self.bucket_name,self.prefix), shell=True, stdout=subprocess.PIPE)
             process.wait()
             if process.returncode == 0:
                 listdirs = process.stdout.read()
@@ -150,7 +143,7 @@ class DownloadHandler(object):
                 (bucket.name, self.prefix, target_file or ''))
 
         log.debug("gsutil cat %s" % (key))
-        process = subprocess.Popen("gsutil cat %s" % (key), shell=True, stdout=subprocess.PIPE)
+        process = subprocess.Popen("gsutil cat %s 2> /dev/null" % (key), shell=True, stdout=subprocess.PIPE)
         process.wait()
         if process.returncode == 0:
             json_data = json.loads(process.stdout.read())
@@ -223,7 +216,7 @@ class DownloadHandler(object):
                     if download and key:
                         log.info('Thread #%d downloading %s from %s to %s' %
                             (idx, fname, key, destfile))
-                        process = subprocess.Popen("gsutil cp %s %s" % (key,destfile), shell=True, stdout=subprocess.PIPE)
+                        process = subprocess.Popen("gsutil cp %s %s 2> /dev/null" % (key,destfile), shell=True, stdout=subprocess.PIPE)
                         process.wait()
                         if process.returncode != 0:
                             raise Exception('Thread #%d unable to download %s' % (idx, key))

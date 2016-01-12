@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 
-""" Cleans SSTables on S3 """
+""" Cleans SSTables on GS """
 
 import argparse
-import boto
 import json
 import logging
 import os
@@ -13,9 +12,6 @@ import StringIO
 import subprocess
 import time
 import tempfile
-
-from datetime import datetime
-from dateutil import parser as dtparser
 
 now = None
 
@@ -36,27 +32,47 @@ def clean_backups(args, log):
         args.name = socket.getfqdn() + ":"
 
     try:
-        log.debug("gsutil ls -l gs://%s/%s%s" % (args.bucket,args.name,args.path))
-        process = subprocess.Popen("gsutil ls -l gs://%s/%s%s | grep -v TOTAL" % (args.bucket, args.name, args.path), shell=True, stdout=subprocess.PIPE)
-        process.wait()
+        log.debug("gsutil ls -lR gs://%s/%s%s" % (args.bucket,args.name,args.path))
+        tmpfile = tempfile.NamedTemporaryFile(delete=False)
+        process = subprocess.Popen("gsutil ls -lR gs://%s/%s%s | grep -v TOTAL" % (args.bucket, args.name, args.path), shell=True, stdout=tmpfile)
+        process.communicate()[0]
         if process.returncode != 0:
             raise Exception("%s/%s%s" % (args.bucket, args.name, args.path))
         else:
+            tmpfile.close()
             log.info("Connected to GS, getting keys ...")
-            keys = process.stdout.read()
+            keys = open(tmpfile.name,"r")
             key_list=[]
+            directory = False
             if keys:
-                for key in StringIO.StringIO(keys):
+                for key in keys:
                     key = key.strip()
-                    log.debug("%s" % (key))
-                    last_modified = key.split(" ")[2]
-                    file_name = key.split(" ")[4]
-                    key_list.append((file_name, time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ"))))
+                    if key.endswith("/:"):
+                        log.debug("Directory %s" % (key))
+                        directory = True
+                    else:
+                        if len(key) > 0:
+                            log.debug("File %s" % (key))
+                        directory = False
+
+                    if not directory and (len(key) > 0):
+                        last_modified = key.split(" ")[2]
+                        file_name = key.split(" ")[4]
+                        key_list.append((file_name, time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ"))))
 
     except Exception as e:
         log.error('Problem getting keys from GS bucket: %s', e)
+        if keys:
+            keys.close()
+        if tmpfile:
+            tmpfile.close()
+            os.unlink(tmpfile.name)
         sys.exit(1)
 
+    if keys:
+        keys.close()
+        os.unlink(tmpfile.name)
+        
     json_keys = []
     to_delete = set() # we'll remove from this list
     for k in sorted(
@@ -82,7 +98,7 @@ def clean_backups(args, log):
             if not args.keep_existing:
                 break
 
-        log.debug("gsutil cat %s" % (jkey[0]))
+        log.debug("gsutil cat %s 2> /dev/null" % (jkey[0]))
         process = subprocess.Popen("gsutil cat %s" % (jkey[0]), shell=True, stdout=subprocess.PIPE)
         process.wait()
         if process.returncode == 0:
@@ -114,6 +130,7 @@ def clean_backups(args, log):
             to_delete.remove(jkey[0])
 
     to_del_len = len(to_delete)
+
     if args.list_deletes:
         # chunk into lines with 10 files each to avoid either too many lines
         # or one gigantic line
@@ -131,27 +148,31 @@ def clean_backups(args, log):
         log.debug("Test mode, nothing deleted")
         return
 
-    try:
-        log.info("Deleting %s keys", to_del_len)
-        tmpfile = tempfile.NamedTemporaryFile(delete=False)
-        for key in to_delete:
-            tmpfile.write("%s\n" % (key,))
-        process = subprocess.Popen("cat %s | gsutil -m rm -I" % (tmpfile.name), shell=True, stdout=subprocess.PIPE)
-        process.wait()
-        if process.returncode != 0:
-            raise Exception("%s" % (process.stdout.read()))
-        else:
-            log.debug("%s\n%s" % (tmpfile.name, process.stdout.read()))
-            tmpfile.close()
+    if to_del_len > 0:
+        try:
+            log.info("Deleting %s keys", to_del_len)
+            
+            # Remove the -m option to get the debug output from gsutil
+            process = subprocess.Popen(['gsutil','-m','rm','-I'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            
+            for key in to_delete:
+                process.stdin.write("%s\n" % (key))
+                log.debug("Deleting key %s" %(key))
 
-    except Exception as e:
-        log.error('GS delete ERR, will try again later [%s]', e)
+            output = process.communicate()[0]
 
-    log.info("Keys deleted")
+            if process.returncode != 0:
+                raise Exception("Unable to delete keys" % (output))
+
+        except Exception as e:
+            log.error('GS delete ERR, will try again later [%s]', e)
+            return
+
+        log.info("%d keys deleted" % (to_del_len))
 
 def main(log):
     parser = argparse.ArgumentParser(
-        description='Clean SSTables from S3. Scroll backwards through '
+        description='Clean SSTables from GS. Scroll backwards through '
         '-listdir.json keys in chronological order collecting a "keeper" '
         'list until it reaches it\'s age cutoff. Deletes all keys not in that '
         'list')
@@ -174,21 +195,6 @@ def main(log):
         action='store_true',
         help='Keep files that still exist on this server regardless of age')
     parser.add_argument(
-        '-k',
-        '--key',
-        dest='key',
-        default=os.environ.get('AWS_ACCESS_KEY_ID'),
-        help='Amazon S3 Key (default from AWS_ACCESS_KEY_ID in environment)')
-    parser.add_argument(
-        '-s',
-        '--secret',
-        dest='secret',
-        default=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        help='Amazon S3 Secret (default from AWS_SECRET_ACCESS_KEY in environment)')
-    parser.add_argument('--token',
-        default=os.environ.get('AWS_SECURITY_TOKEN'),
-        help='Amazon S3 Token (default from AWS_SECURITY_TOKEN in environment)')
-    parser.add_argument(
         '-n',
         '--name',
         dest='name',
@@ -197,10 +203,10 @@ def main(log):
              'this host')
     parser.add_argument(
         'bucket',
-        help='S3 Bucket')
+        help='GS Bucket')
     parser.add_argument(
         'path',
-        help='Path portion of key in S3')
+        help='Path portion of key in GS')
     parser.add_argument(
         'age',
         type=int,
