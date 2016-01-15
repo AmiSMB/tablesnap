@@ -78,7 +78,7 @@ class DownloadHandler(object):
         self.target = args.target[0]
         self.origin = args.origin[0]
         self.preserve = args.preserve
-        self.key = args.aws_key
+        self.key = args.gcs_key
         self.secret = args.aws_secret
         self.token = args.token
         self.bucket_name = args.bucket[0]
@@ -94,6 +94,14 @@ class DownloadHandler(object):
         if not self.preserve:
             owner = args.owner
             group = args.group
+
+        # Use the correct Google Cloud Storage account if given
+        if args.gcs_key:
+            process = subprocess.Popen("gcloud auth activate-service-account --key-file %s" % (args.gcs_key), shell=True, stdout=subprocess.PIPE)
+            process.communicate()
+            if process.returncode != 0:
+                log.debug("Unable to use GCS key %s" %(args.gcs_key))
+                raise OSError('Unable to configure Gcloud with %s' %(args.gce_key))
 
         try:
             self.owner = pwd.getpwnam(owner).pw_uid
@@ -273,9 +281,9 @@ def main():
         'code is straightforward, the program assumes the files you are '
         'restoring got previously backed up with `tablesnap`',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('-k', '--aws-key',
-        default=os.environ.get('AWS_ACCESS_KEY_ID'),
-        help='Amazon S3 Key (default from AWS_ACCESS_KEY_ID in environment)')
+    ap.add_argument('-k', '--gcs-key',
+        default=os.environ.get('GCLOUD_KEY'),
+        help='Google Cloud Storage Key (default from GCLOUD_KEY in environment)')
     ap.add_argument('-s', '--aws-secret',
         default=os.environ.get('AWS_SECRET_ACCESS_KEY'),
         help='Amazon S3 Secret (default from AWS_SECRET_ACCESS_KEY in environment)')
