@@ -1,0 +1,5 @@
+RUN=yes
+DAEMON_OPTS="-r -k /cassandra/backup/gcloud-key ftf-bk-d /cassandra/data"
+
+# Log to syslog
+export TABLESNAP_SYSLOG=True
