@@ -44,7 +44,7 @@ default_log.info('Starting up')
 default_threads = 4
 
 # Default retries
-default_retries = 1
+default_retries = 3
 
 # S3 limit for single file upload
 s3_limit = 5 * 2**30
@@ -69,6 +69,11 @@ class UploadHandler(pyinotify.ProcessEvent):
                 log=default_log,
                 md5_on_start=False):
         self.key = key
+        if self.key:
+            self.gcloud_auth = "gcloud auth activate-service-account --key-file %s 2> /dev/null;" % (key)
+        else:
+            self.gcloud_auth = None
+
         self.secret = secret
         self.token = token
         self.bucket_name = bucket_name
@@ -151,9 +156,10 @@ class UploadHandler(pyinotify.ProcessEvent):
         for r in range(self.retries):
             try:
                 self.log.debug("keyexists: Getting stats for gs://%s/%s" % (bucket, keyname))
-                process = subprocess.Popen("gsutil stat gs://%s/%s 2> /dev/null" % (bucket, keyname), shell=True, stdout=subprocess.PIPE)
+                process = subprocess.Popen("%sgsutil stat gs://%s/%s 2> /dev/null" % (self.gcloud_auth, bucket, keyname), shell=True, stdout=subprocess.PIPE)
                 process.wait()
                 returncode = process.returncode
+                time.sleep(0.75)
                 key = process.stdout.read()
                 if returncode != 0:
                     self.log.debug('Key %s does not exist' % (keyname,))
@@ -322,20 +328,23 @@ class UploadHandler(pyinotify.ProcessEvent):
                 for r in range(self.retries):
                     try:
                         self.log.debug('Writing index json file %s-listdir.json' % keyname)
-                        process = subprocess.Popen('gsutil -h Content-Type:application/json cp %s gs://%s/%s-listdir.json 2> /dev/null' % (fp.name, bucket, keyname), shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        process.stdin.write(json_str)
+                        tmpfile = tempfile.NamedTemporaryFile(delete=False)
+                        tmpfile.write(json_str)
+                        tmpfile.close()
+                        process = subprocess.Popen('%sgsutil -h Content-Type:application/json cp %s gs://%s/%s-listdir.json 2> /dev/null' % (self.gcloud_auth, tmpfile.name, bucket, keyname), shell=True, stdout=subprocess.PIPE)
                         output = process.communicate()[0]
+                        os.unlink(tmpfile.name)
+                        time.sleep(0.75)
                         if process.returncode != 0:
-                            self.log.debug('Unable to upload %s-listdir.json due to %s' % (keyname,output))
-                            raise
+                            self.log.debug('Unable to upload %s-listdir.json due to %s code %s' % (keyname,output,process.returncode))
+                            raise Exception(process.returncode)
                         else:
                             self.log.debug('Successfully uploaded %s-listdir.json' % (keyname))
                         break
-                    except:
+                    except Exception as e:
                         if r == self.retries - 1:
-                            self.log.critical("Failed to upload directory "
-                                              "listing.")
-                            raise
+                            self.log.critical("Failed to upload directory listing.")
+                            #raise Exception("Failed to upload directory listing")
                         bucket = self.get_bucket()
                         continue
 
@@ -354,7 +363,7 @@ class UploadHandler(pyinotify.ProcessEvent):
             except:
                 pass
 
-            self.log.info('Uploading %s' % filename)
+            self.log.debug('Uploading %s' % filename)
 
             meta = json.dumps(meta)
 
@@ -394,15 +403,18 @@ class UploadHandler(pyinotify.ProcessEvent):
                         progress(100, 100)
                     else:
                     """
-                    self.log.debug('Performing monolithic upload for bucket %s keyname %s filename %s md5 %s stat %s' % (bucket, keyname, filename, md5, meta.replace('/\"\ /g','')))
-                    process = subprocess.Popen('gsutil -h Content-MD5:%s -h x-goog-meta-stat:"%s" cp %s gs://%s/%s 2> /dev/null' % (md5, meta.replace('/\"\ /g',''), filename, bucket, keyname), shell=True, stdout=subprocess.PIPE)
+                    self.log.debug('Performing monolithic upload for bucket %s keyname %s filename %s md5 %s stat %s attempt %d' % (bucket, keyname, filename, md5, meta.replace('/\"\ /g',''),r+1))
+                    process = subprocess.Popen('%sgsutil -h Content-MD5:%s -h x-goog-meta-stat:"%s" cp %s gs://%s/%s 2> /dev/null' % (self.gcloud_auth, md5, meta.replace('/\"\ /g',''), filename, bucket, keyname), shell=True, stdout=subprocess.PIPE)
                     process.wait()
+                    time.sleep(0.75)
                     if process.returncode != 0:
+                        self.log.critical("Upload of %s failed" % (filename))
                         raise
                     else:
                         self.log.info("Upload of %s successful" % (filename))
                     #key.set_metadata('stat', meta)
                     break
+
                 except:
                     if not os.path.exists(filename):
                         # File was removed? Skip
@@ -410,12 +422,13 @@ class UploadHandler(pyinotify.ProcessEvent):
 
                     if r == self.retries - 1:
                         self.log.critical("Failed to upload file contents.")
-                        raise
+                        #raise Exception("Failed to upload file contents")
                     bucket = self.get_bucket()
                     continue
-        except:
+
+        except Exception as e:
             self.log.error('Error uploading %s\n%s' % (keyname, format_exc()))
-            raise
+            return
 
 def get_mask(listen_events):
     if not listen_events:
@@ -468,9 +481,9 @@ def main():
         'the time of the copy.')
     parser.add_argument('bucket', help='GS bucket')
     parser.add_argument('paths', nargs='+', help='Paths to be watched')
-    parser.add_argument('-k', '--aws-key',
-        default=os.environ.get('AWS_ACCESS_KEY_ID'),
-        help='Amazon S3 Key (default from AWS_ACCESS_KEY_ID in environment)')
+    parser.add_argument('-k', '--gcs-key',
+        default=os.environ.get('GCLOUD_KEY'),
+        help='Google Cloud Storage Key (default from GCLOUD_KEY in environment)')
     parser.add_argument('-s', '--aws-secret',
         default=os.environ.get('AWS_SECRET_ACCESS_KEY'),
         help='Amazon S3 Secret (default from AWS_SECRET_ACCESS_KEY in environment)')
@@ -539,7 +552,7 @@ def main():
     #s3 = boto.connect_s3(aws_access_key_id=args.aws_key,
     #                     aws_secret_access_key=args.aws_secret,
     #                     security_token=args.aws_token)
-    handler = UploadHandler(threads=args.threads, key=args.aws_key,
+    handler = UploadHandler(threads=args.threads, key=args.gcs_key,
                             secret=args.aws_secret, token=args.aws_token,
                             bucket_name=args.bucket,
                             prefix=args.prefix, name=args.name,
