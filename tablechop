@@ -12,6 +12,7 @@ import StringIO
 import subprocess
 import time
 import tempfile
+import shutil
 
 now = None
 
@@ -31,12 +32,21 @@ def clean_backups(args, log):
     if not args.name:
         args.name = socket.getfqdn() + ":"
 
+    # Use the correct Google Cloud Storage account if given
+    if args.gcs_key:
+        process = subprocess.Popen("gcloud auth activate-service-account --key-file %s" % (args.gcs_key), shell=True, stdout=subprocess.PIPE)
+        process.communicate()
+        if process.returncode != 0:
+            log.debug("Unable to use GCS key %s" %(args.gcs_key))
+            return
+
     try:
         log.debug("gsutil ls -lR gs://%s/%s%s" % (args.bucket,args.name,args.path))
         tmpfile = tempfile.NamedTemporaryFile(delete=False)
         process = subprocess.Popen("gsutil ls -lR gs://%s/%s%s | grep -v TOTAL" % (args.bucket, args.name, args.path), shell=True, stdout=tmpfile)
         process.communicate()[0]
         if process.returncode != 0:
+            keys=None
             raise Exception("%s/%s%s" % (args.bucket, args.name, args.path))
         else:
             tmpfile.close()
@@ -58,7 +68,7 @@ def clean_backups(args, log):
                     if not directory and (len(key) > 0):
                         last_modified = key.split(" ")[2]
                         file_name = key.split(" ")[4]
-                        key_list.append((file_name, time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ"))))
+                        key_list.append((file_name, int(time.mktime(time.strptime(last_modified, "%Y-%m-%dT%H:%M:%SZ")))))
 
     except Exception as e:
         log.error('Problem getting keys from GS bucket: %s', e)
@@ -74,13 +84,14 @@ def clean_backups(args, log):
         os.unlink(tmpfile.name)
         
     json_keys = []
-    to_delete = set() # we'll remove from this list
+    to_delete = [] # we'll remove from this list
     for k in sorted(
         key_list,
         key=lambda x: x[1],
         reverse=True, # most recent first
     ):
-        to_delete.add(k[0])
+        log.debug(k)
+        to_delete.append(k)
         if k[0].endswith('-listdir.json'):
             json_keys.append(k)
 
@@ -88,9 +99,36 @@ def clean_backups(args, log):
     log.debug("%s json listdir keys", len(json_keys))
 
     is_old = False  # used in testing for existence of file on server
+
+    # Download the key files locally for faster processing
+    tmpdir = tempfile.mkdtemp()
+    tmpfile = tempfile.NamedTemporaryFile(delete=False)
+    for jkey in json_keys:
+        tmpfile.write("%s\n" % (jkey[0]))
+        log.debug("Getting json file %s" %(jkey[0].split('/')[-1]))
+
+    tmpfile.close()
+
+    # Remove the -m option to get the debug output from gsutil
+    cmd = r'cat %s | gsutil -m cp -I %s/' % (tmpfile.name,tmpdir)
+    log.debug(cmd)
+    process = subprocess.Popen(cmd, shell=True)
+    process.communicate()[0]
+
+    if tmpfile:
+        tmpfile.close()
+        os.unlink(tmpfile.name)
+
+    if process.returncode != 0:
+        log.error("Unable to get json files from GCS")
+        return
+
+    to_delete_dict = dict(to_delete)
     for jkey in json_keys:
         log.debug("key dated : %s (%s)", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(jkey[1])),
                   jkey[0].split('/')[-1])
+
+        jdict = []
         if days_ago(jkey[1]) > args.age:
             # We've gone back past our cutoff
             log.info("Reached cutoff at timestamp %s", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(jkey[1])))
@@ -98,46 +136,60 @@ def clean_backups(args, log):
             if not args.keep_existing:
                 break
 
-        log.debug("gsutil cat %s 2> /dev/null" % (jkey[0]))
-        process = subprocess.Popen("gsutil cat %s" % (jkey[0]), shell=True, stdout=subprocess.PIPE)
+        cmd = r"cat %s/%s 2> /dev/null" % (tmpdir,jkey[0].split('/')[-1])
+        #log.debug(cmd)
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
         process.wait()
-        if process.returncode == 0:
-            jdict = json.loads(process.stdout.read())
-        else:
+        if process.returncode != 0:
             log.debug('Unable to get %s' % (jkey[0]))
+        else:
+            jdict = json.loads(process.stdout.read())
+            if jdict:
+                if len(jdict.values()) != 1:
+                    raise SystemError('-listdir.json file should have '
+                        'a single key/value pair!')
+                dirname = jdict.keys()[0]
+                # fullpaths here since some files are in subdirectories
+                fullpaths = [os.path.join(dirname, x) for x in jdict.values()[0]]
+                keep_jkey = False # assume we are deleting the jkey
+                for x in fullpaths:
+                    log.debug("Checking %s" % (x))
+                    keep_file = True # assume we are keeping the file - this is the default behavior
+                    # if we are checking if we should keep existing files
+                    if args.keep_existing and is_old and not os.path.isfile(x):
+                        # don't keep the file if it is old and it does not exist
+                        log.debug("%s does not exist locally" %(x))
+                        keep_file = False
 
-        if len(jdict.values()) != 1:
-            raise SystemError('-listdir.json file should have '
-                'a single key/value pair!')
-        dirname = jdict.keys()[0]
-        # fullpaths here since some files are in subdirectories
-        fullpaths = [os.path.join(dirname, x) for x in jdict.values()[0]]
-        keep_jkey = False # assume we are deleting the jkey
-        for x in fullpaths:
-            keep_file = True # assume we are keeping the file - this is the default behavior
-            # if we are checking if we should keep existing files
-            if args.keep_existing and is_old and not os.path.isfile(x):
-                # don't keep the file if it is old and it does not exist
-                keep_file = False
+                    keep_jkey = keep_jkey or keep_file  # keep the jkey if we are keeping any of the files
+                    key_to_keep = 'gs://%s/%s%s' % (args.bucket, args.name, x)
+                    # if we are keeping the file
+                    if key_to_keep in to_delete_dict.keys():
+                        if keep_file:
+                            log.debug("Keeping %s" % (key_to_keep))
+                            to_delete_dict.pop(key_to_keep, None)
+                        else:
+                            log.debug("Not keeping %s - %s %s" % (key_to_keep, keep_file, key_to_keep in to_delete))
+                    else:
+                        log.debug("%s not in delete list" % (key_to_keep))
 
-            keep_jkey = keep_jkey or keep_file  # keep the jkey if we are keeping any of the files
-            key_to_keep = 'gs://%s/%s%s' % (args.bucket, args.name, x)
-            # if we are keeping the file
-            if keep_file and key_to_keep in to_delete:
-                to_delete.remove(key_to_keep)
+                if keep_jkey and jkey[0] in to_delete_dict.keys():
+                    to_delete_dict.pop(jkey[0], None)
+        time.sleep(0.2)
 
-        if keep_jkey and jkey[0] in to_delete:
-            to_delete.remove(jkey[0])
-
+    to_delete = [(k,v) for k,v in to_delete_dict.iteritems()]
+    shutil.rmtree(tmpdir)
     to_del_len = len(to_delete)
 
     if args.list_deletes:
         # chunk into lines with 10 files each to avoid either too many lines
         # or one gigantic line
         to_del_list = list(to_delete)
-        for delchunk in [','.join(to_del_list[i:i+10]) for \
-                         i in xrange(0, to_del_len, 10)]:
-            log.info("Files to delete: %s" % delchunk)
+        for key in to_del_list:
+            log.info("File to delete %s last modified %s %s" % (key[0], key[1], days_ago(key[1]) > args.age))
+        #for delchunk in [','.join(to_del_list[i:i+10]) for \
+        #                 i in xrange(0, to_del_len, 10)]:
+        #    log.info("Files to delete: %s" % delchunk)
 
     if args.debug:
         log.debug("%s non-keeper keys to delete", to_del_len)
@@ -151,24 +203,37 @@ def clean_backups(args, log):
     if to_del_len > 0:
         try:
             log.info("Deleting %s keys", to_del_len)
-            
-            # Remove the -m option to get the debug output from gsutil
-            process = subprocess.Popen(['gsutil','-m','rm','-I'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            tmpfile = tempfile.NamedTemporaryFile(delete=False)
             
             for key in to_delete:
-                process.stdin.write("%s\n" % (key))
-                log.debug("Deleting key %s" %(key))
+                tmpfile.write("%s\n" % (key[0]))
+                log.debug("Deleting key %s" %(key[0]))
 
-            output = process.communicate()[0]
+            tmpfile.close()
+
+            # Remove the -m option to get the debug output from gsutil
+            cmd = r'cat %s | gsutil -m rm -I' % tmpfile.name
+            log.debug(cmd)
+            process = subprocess.Popen(cmd, shell=True)
+            process.communicate()[0]
+
+            if tmpfile:
+                tmpfile.close()
+                os.unlink(tmpfile.name)
 
             if process.returncode != 0:
-                raise Exception("Unable to delete keys" % (output))
+                raise Exception("Unable to delete keys ERR=%d" % (process.returncode))
+            else:
+                log.info("%d keys deleted" % (to_del_len))
 
         except Exception as e:
             log.error('GS delete ERR, will try again later [%s]', e)
-            return
+            pass
 
-        log.info("%d keys deleted" % (to_del_len))
+        log.info("Deletes completed")
+    else:
+        log.info("Nothing to delete. Completed")
+    return
 
 def main(log):
     parser = argparse.ArgumentParser(
@@ -194,6 +259,9 @@ def main(log):
         dest='keep_existing',
         action='store_true',
         help='Keep files that still exist on this server regardless of age')
+    parser.add_argument('-k', '--gcs-key',
+        default=os.environ.get('GCLOUD_KEY'),
+        help='Google Cloud Storage Key (default from GCLOUD_KEY in environment)')
     parser.add_argument(
         '-n',
         '--name',
